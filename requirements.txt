@@ -2,3 +2,8 @@ pooltool-billiards
 numpy
 bayesian-optimization
 
+# MuZero依赖
+torch>=2.0.0
+torchvision
+scikit-learn
+

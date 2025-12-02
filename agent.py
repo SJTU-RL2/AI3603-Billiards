@@ -322,18 +322,121 @@ class BasicAgent(Agent):
             traceback.print_exc()
             return self._random_action()
 
+class MuZeroAgent(Agent):
+    """基于MuZero的智能Agent
+
+    使用深度学习和MCTS进行决策
+    """
+
+    def __init__(self, checkpoint_path=None, num_simulations=30, temperature=0.0):
+        """初始化MuZeroAgent
+
+        参数：
+            checkpoint_path: 模型检查点路径
+            num_simulations: MCTS模拟次数
+            temperature: 温度参数（0=贪心，>0=探索）
+        """
+        super().__init__()
+
+        try:
+            import torch
+            from muzero_core import MuZeroNetwork, encode_observation
+            from muzero_mcts import MCTS
+
+            # 创建网络
+            self.network = MuZeroNetwork(
+                state_dim=128,
+                action_dim=5,
+                hidden_dim=256
+            )
+
+            # 加载检查点
+            if checkpoint_path and os.path.exists(checkpoint_path):
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                checkpoint = torch.load(checkpoint_path, map_location=device)
+                self.network.load_state_dict(checkpoint['network_state_dict'])
+                print(f"[MuZeroAgent] 从 {checkpoint_path} 加载模型 (epoch {checkpoint.get('epoch', 0)})")
+            else:
+                print(f"[MuZeroAgent] 警告：未找到检查点 {checkpoint_path}，使用随机初始化网络")
+
+            self.network.eval()
+
+            # 创建MCTS
+            self.mcts = MCTS(
+                network=self.network,
+                num_simulations=num_simulations,
+                num_actions_per_node=10,
+                c_puct=1.5,
+                temperature=temperature
+            )
+
+            self.encode_observation = encode_observation
+            self.num_simulations = num_simulations
+
+            print(f"[MuZeroAgent] 初始化完成 (模拟次数: {num_simulations})")
+
+        except ImportError as e:
+            print(f"[MuZeroAgent] 导入错误: {e}")
+            print("[MuZeroAgent] 请确保muzero相关文件存在，降级为随机agent")
+            self.network = None
+            self.mcts = None
+
+    def decision(self, balls=None, my_targets=None, table=None):
+        """使用MuZero+MCTS进行决策
+
+        参数：
+            balls: 球状态字典
+            my_targets: 目标球ID列表
+            table: 球桌对象
+
+        返回：
+            dict: {'V0', 'phi', 'theta', 'a', 'b'}
+        """
+        if balls is None or self.network is None or self.mcts is None:
+            print("[MuZeroAgent] 降级为随机动作")
+            return self._random_action()
+
+        try:
+            # 编码观测
+            observation = self.encode_observation(balls, my_targets, table)
+
+            # MCTS搜索
+            action = self.mcts.run(observation, add_noise=False)
+
+            # 转换为字典格式
+            action_dict = {
+                'V0': float(action[0]),
+                'phi': float(action[1]),
+                'theta': float(action[2]),
+                'a': float(action[3]),
+                'b': float(action[4])
+            }
+
+            print(f"[MuZeroAgent] 决策: V0={action_dict['V0']:.2f}, "
+                  f"phi={action_dict['phi']:.2f}, theta={action_dict['theta']:.2f}, "
+                  f"a={action_dict['a']:.3f}, b={action_dict['b']:.3f}")
+
+            return action_dict
+
+        except Exception as e:
+            print(f"[MuZeroAgent] 决策失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return self._random_action()
+
+
 class NewAgent(Agent):
     """自定义 Agent 模板（待学生实现）"""
-    
+
     def __init__(self):
         pass
-    
+
     def decision(self, balls=None, my_targets=None, table=None):
         """决策方法
-        
+
         参数：
             observation: (balls, my_targets, table)
-        
+
         返回：
             dict: {'V0', 'phi', 'theta', 'a', 'b'}
         """
