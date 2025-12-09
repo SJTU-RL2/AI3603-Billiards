@@ -370,7 +370,7 @@ class SACAgent():
     def load_checkpoint(self):
         if not self.checkpoint_path.is_file():
             return
-        checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
         self.actor.load_state_dict(checkpoint['actor'])
         self.critic1.load_state_dict(checkpoint['critic1'])
         self.critic2.load_state_dict(checkpoint['critic2'])
@@ -386,20 +386,58 @@ class SACAgent():
 
     @staticmethod
     def compute_dense_reward(step_info: dict, my_targets: List[str]) -> float:
+        """
+        计算密集奖励函数
+
+        设计理念：
+        - 鼓励进攻：进球获得正奖励，无效击球给予小惩罚
+        - 严厉惩罚犯规：白球进袋、非法击球等
+        - 强化胜负：合法黑8给予大奖励，非法黑8严重惩罚
+        - 进度激励：剩余球越少，每球价值越高
+        """
         reward = 0.0
-        reward += 50.0 * len(step_info.get('ME_INTO_POCKET', []))
-        reward -= 20.0 * len(step_info.get('ENEMY_INTO_POCKET', []))
+
+        # 1. 进球奖励（基础分 + 进度加成）
+        my_pocketed = step_info.get('ME_INTO_POCKET', [])
+        if my_pocketed:
+            # 计算剩余目标球数（不含黑8）
+            remaining_targets = len([t for t in my_targets if t != '8'])
+            # 基础奖励50分，随着剩余球减少，奖励增加（最后一颗最多75分）
+            progress_bonus = 1.0 + (7 - remaining_targets) * 0.05  # 1.0 到 1.35
+            reward += 50.0 * len(my_pocketed) * progress_bonus
+
+        # 2. 对方进球惩罚（虽然不常见，但可能因犯规导致）
+        enemy_pocketed = step_info.get('ENEMY_INTO_POCKET', [])
+        if enemy_pocketed:
+            reward -= 25.0 * len(enemy_pocketed)
+
+        # 3. 白球进袋（严重犯规）
         if step_info.get('WHITE_BALL_INTO_POCKET'):
             reward -= 100.0
+
+        # 4. 黑8球进袋（胜负关键）
         if step_info.get('BLACK_BALL_INTO_POCKET'):
+            # 合法打进黑8（己方目标球已清空）= 胜利
             legal = len(my_targets) == 1 and my_targets[0] == '8'
-            reward += 100.0 if legal else -150.0
+            if legal:
+                reward += 300.0  # 大幅增加胜利奖励
+            else:
+                reward -= 300.0  # 大幅增加非法黑8惩罚
+
+        # 5. 首球犯规（未先击中目标球）
         if step_info.get('FOUL_FIRST_HIT'):
             reward -= 30.0
+
+        # 6. 无进球且无碰库（消极击球）
         if step_info.get('NO_POCKET_NO_RAIL'):
             reward -= 30.0
+
+        # 7. 完全未击中任何球（严重失误）
         if step_info.get('NO_HIT'):
             reward -= 50.0
+
+        # 8. 合法但无进球的击球：小惩罚，鼓励进攻而非保守
         if reward == 0.0:
-            reward = 10.0
+            reward = -5.0  # 从 +10 改为 -5，鼓励主动进攻
+
         return float(reward)

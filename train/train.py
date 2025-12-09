@@ -185,7 +185,7 @@ def main():
 			episode_reward += total_reward
 
 			if done:
-				next_state = np.zeros_like(state)
+				next_state = state  # 保持当前状态，(1-dones)会清零Q值贡献
 			else:
 				next_balls, next_targets, next_table = env.get_observation(args.control_player)
 				next_state = sac_agent.encode_observation(next_balls, next_targets, next_table)
