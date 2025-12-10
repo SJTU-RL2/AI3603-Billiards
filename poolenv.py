@@ -297,7 +297,7 @@ class PoolEnv():
         # 获取 final_states
         # final_states = collect_ball_states(shot)
         # 更新球状态到本次击球后的结果
-        self.balls = shot.balls 
+        self.balls = shot.balls
         new_pocketed = [bid for bid, b in shot.balls.items() if b.state.s == 4 and self.last_state[bid].state.s != 4]
 
         events = shot.events

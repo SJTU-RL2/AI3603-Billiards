@@ -1,4 +1,5 @@
 pooltool-billiards
 numpy
 bayesian-optimization
+torch
 
