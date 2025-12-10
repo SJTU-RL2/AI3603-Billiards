@@ -81,8 +81,12 @@ def analyze_shot_for_reward(shot: pt.System, last_state: dict, player_targets: l
         if ('8' not in opponent_plus_eight):
             opponent_plus_eight.append('8')
             
-        if len(remaining_own_before) > 0 and first_contact_ball_id in opponent_plus_eight:
-            foul_first_hit = True
+        if len(remaining_own_before) > 0:
+            if first_contact_ball_id in opponent_plus_eight:
+                foul_first_hit = True
+        else:
+            if first_contact_ball_id != '8':
+                foul_first_hit = True
     
     # 3. 分析碰库
     cue_hit_cushion = False

@@ -27,11 +27,22 @@
 此为共享链接，各组同学通过**overleaf**打开后左上角点击**Menu**，选择**Copy project**后在自己的模板上编辑
 
 # 环境配置
-操作系统推荐 Ubuntu 22.04
-Python版本推荐3.10以上
+操作系统推荐 Ubuntu 22.04，Python版本推荐3.13
+
 安装相关依赖：
 ```bash
-pip install -r requirements.txt
+# 创建环境
+conda create -n poolenv python=3.13
+conda activate poolenv
+# clone pooltool
+git clone https://github.com/SJTU-RL2/pooltool.git
+cd pooltool
+# 安装poetry
+pip install "poetry==2.2.1"
+# 基于源代码安装poolenv
+poetry install --with=dev,docs
+# 运行base agent需要安装的库
+pip install bayesian-optimization numpy
 ```
 # 实现思路
 本项目不限制实现思路，可以使用包括但不限于以下思路的实现：
