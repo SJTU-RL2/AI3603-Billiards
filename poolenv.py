@@ -302,11 +302,15 @@ class PoolEnv():
 
         events = shot.events
         first_contact_ball_id = None
+        # 定义合法的球ID集合（排除 'cue' 和其他非球对象如 'cue stick'）
+        valid_ball_ids = {'1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15'}
+        
         for e in events:
             et = str(e.event_type).lower()
             ids = list(e.ids) if hasattr(e, 'ids') else []
             if ('cushion' not in et) and ('pocket' not in et) and ('cue' in ids):
-                other_ids = [i for i in ids if i != 'cue']
+                # 过滤掉 'cue' 和非球对象（如 'cue stick'），只保留合法的球ID
+                other_ids = [i for i in ids if i != 'cue' and i in valid_ball_ids]
                 if other_ids:
                     first_contact_ball_id = other_ids[0]
                     break
@@ -362,10 +366,8 @@ class PoolEnv():
         remaining_own_before = [bid for bid in self.player_targets[player] if self.last_state[bid].state.s != 4]
         # 黑8掉袋 (胜负判断)
         if "8" in new_pocketed:
-            # 检查当前玩家是否清空了自己所有球
-            remaining_own = [bid for bid in self.player_targets[player] if self.balls[bid].state.s != 4]
-            
-            if len(remaining_own) == 0:
+            # 检查击球前是否已清空所有目标球（不能同时打进最后目标球+黑8）
+            if len(remaining_own_before) == 0:
                 print(f"🏆 Player {player} 成功打进黑8，获胜！")
                 self.winner = self.players[self.curr_player]
             else:
