@@ -17,6 +17,22 @@ from utils import set_random_seed
 from poolenv import PoolEnv
 from agent import BasicAgent, NewAgent
 
+
+def load_new_agent(checkpoint_path: str = "checkpoints/ppo_newagent_ep0200.zip") -> NewAgent:
+    agent = NewAgent(training=False)
+    if not checkpoint_path:
+        return agent
+    import os
+
+    if not os.path.isabs(checkpoint_path):
+        checkpoint_path = os.path.join(os.getcwd(), checkpoint_path)
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    agent.load(checkpoint_path)
+    agent.set_training(False)
+    print(f"Loaded NewAgent checkpoint from {checkpoint_path}")
+    return agent
+
 # 设置随机种子，enable=True 时使用固定种子，enable=False 时使用完全随机
 # 根据需求，我们在这里统一设置随机种子，确保 agent 双方的全局击球扰动使用相同的随机状态
 set_random_seed(enable=False, seed=42)
@@ -25,7 +41,8 @@ env = PoolEnv()
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
 n_games = 120  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
 
-agent_a, agent_b = BasicAgent(), NewAgent()
+agent_a = BasicAgent()
+agent_b = load_new_agent()
 
 players = [agent_a, agent_b]  # 用于切换先后手
 target_ball_choice = ['solid', 'solid', 'stripe', 'stripe']  # 轮换球型
