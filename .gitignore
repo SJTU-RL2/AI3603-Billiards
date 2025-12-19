@@ -211,3 +211,6 @@ __marimo__/
 eval/
 report/
 runs/
+
+# others
+safe_shot_flow.md
