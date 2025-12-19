@@ -20,17 +20,24 @@ import time
 import logging
 from datetime import datetime
 
-# 配置评估日志
+# 配置评估日志 - 使用独立的logger避免被poolenv的basicConfig覆盖
 eval_log_filename = f"evaluate_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(message)s',
-    handlers=[
-        logging.FileHandler(eval_log_filename, encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
 eval_logger = logging.getLogger('evaluate')
+eval_logger.setLevel(logging.INFO)
+eval_logger.propagate = False  # 不传播到root logger
+
+# 创建文件和控制台处理器
+file_handler = logging.FileHandler(eval_log_filename, encoding='utf-8')
+stream_handler = logging.StreamHandler()
+
+# 设置格式
+formatter = logging.Formatter('%(message)s')
+file_handler.setFormatter(formatter)
+stream_handler.setFormatter(formatter)
+
+# 添加处理器
+eval_logger.addHandler(file_handler)
+eval_logger.addHandler(stream_handler)
 
 # 设置随机种子，enable=True 时使用固定种子，enable=False 时使用完全随机
 # 根据需求，我们在这里统一设置随机种子，确保 agent 双方的全局击球扰动使用相同的随机状态
@@ -38,7 +45,7 @@ set_random_seed(enable=False, seed=42)
 
 env = PoolEnv()
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
-n_games = 10  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
+n_games = 1  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
 
 agent_a, agent_b = BasicAgent(), NewAgent()
 
@@ -84,6 +91,7 @@ for i in range(n_games):
     
     winner = None
     win_reason = "未知"
+    last_step_info = {}  # 保存最后一次step_info用于判断获胜原因
     
     while True:
         player = env.get_curr_player()
@@ -94,6 +102,7 @@ for i in range(n_games):
         else:
             action = players[(i + 1) % 2].decision(*obs)
         step_info = env.take_shot(action)
+        last_step_info = step_info  # 保存每次的step_info
         
         done, info = env.get_done()
         if not done:
@@ -113,19 +122,28 @@ for i in range(n_games):
             game_duration = game_end_time - game_start_time
             game_times.append(game_duration)
             
-            # 确定获胜原因
+            # 确定获胜原因 - 使用保存的last_step_info
             if info['winner'] == 'SAME':
                 win_reason = "平局（超过最大回合数）"
-            elif step_info.get('CUE_INTO_POCKET') and step_info.get('EIGHT_INTO_POCKET'):
+            elif last_step_info.get('WHITE_BALL_INTO_POCKET') and last_step_info.get('BLACK_BALL_INTO_POCKET'):
                 win_reason = "对手白球+黑8同时进袋"
-            elif step_info.get('EIGHT_INTO_POCKET'):
-                # 检查是否合法打进黑8
-                if step_info.get('LEGAL_EIGHT'):
+            elif last_step_info.get('BLACK_BALL_INTO_POCKET'):
+                # 检查是否合法打进黑8（通过判断winner是否是打球方）
+                # 如果黑8进袋且当前winner不是打球方，说明是非法打进
+                current_player = player  # 最后打球的是谁（循环中的player）
+                # 注意：done时winner已经确定，如果winner不是当前打球方，说明是犯规
+                if info['winner'] == current_player:
                     win_reason = "合法打进黑8"
                 else:
                     win_reason = "对手非法打进黑8"
-            elif step_info.get('CUE_INTO_POCKET'):
+            elif last_step_info.get('WHITE_BALL_INTO_POCKET'):
                 win_reason = "对手白球进袋犯规（关键时刻）"
+            elif last_step_info.get('NO_HIT'):
+                win_reason = "对手白球未接触任何球犯规"
+            elif last_step_info.get('FOUL_FIRST_HIT'):
+                win_reason = "对手首次接触违规球犯规"
+            elif last_step_info.get('NO_POCKET_NO_RAIL'):
+                win_reason = "对手无进球且未碰库犯规"
             else:
                 win_reason = "对手犯规或其他原因"
             

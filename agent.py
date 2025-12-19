@@ -57,51 +57,25 @@ def simulate_with_timeout(shot, timeout=3):
         bool: True 表示模拟成功，False 表示超时或失败
     
     说明：
-        在支持 SIGALRM 的平台（通常为 Unix/Linux）上，使用 signal.SIGALRM 实现硬超时。
-        在 Windows 或不支持 SIGALRM/alarm 的环境、或非主线程中，自动降级为直接调用
-        pt.simulate（不做硬超时），以避免因 SIGALRM 不存在导致评测直接失败。
+        使用 signal.SIGALRM 实现超时机制（仅支持 Unix/Linux）
+        超时后自动恢复，不会导致程序卡死
     """
-    # Windows 没有 SIGALRM；另外 signal.* 通常只能在主线程使用。
-    if not (hasattr(signal, "SIGALRM") and hasattr(signal, "alarm")):
-        try:
-            pt.simulate(shot, inplace=True)
-            return True
-        except Exception as e:
-            logger.warning(f"物理模拟失败（无超时保护降级路径）: {e}")
-            return False
-
+    # 设置超时信号处理器
+    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(timeout)  # 设置超时时间
+    
     try:
-        # 设置超时信号处理器（非主线程可能失败，此时降级）
-        try:
-            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-            signal.alarm(timeout)  # 设置超时时间
-        except Exception as e:
-            logger.debug(f"无法启用SIGALRM超时保护，降级为直接模拟: {e}")
-            pt.simulate(shot, inplace=True)
-            return True
-
         pt.simulate(shot, inplace=True)
         signal.alarm(0)  # 取消超时
         return True
     except SimulationTimeoutError:
-        try:
-            signal.alarm(0)  # 取消超时
-        except Exception:
-            pass
         logger.warning(f"物理模拟超时（>{timeout}秒），跳过此次模拟")
         return False
-    except Exception:
-        try:
-            signal.alarm(0)  # 取消超时
-        except Exception:
-            pass
-        raise
+    except Exception as e:
+        signal.alarm(0)  # 取消超时
+        raise e
     finally:
-        # 恢复原处理器（若 signal 在非主线程不可用，这里也要容错）
-        try:
-            signal.signal(signal.SIGALRM, old_handler)
-        except Exception:
-            pass
+        signal.signal(signal.SIGALRM, old_handler)  # 恢复原处理器
 
 # ============================================
 
@@ -446,22 +420,130 @@ class NewAgent(Agent):
             'a': 0.003,     # 横向偏移标准差
             'b': 0.003      # 纵向偏移标准差
         }
-        # 评估加速：两阶段评估
-        # - SCREEN: 用更少的带噪声采样做快速筛选（用于搜索/微调）
-        # - FINAL: 对最终候选用全量采样复核，保持最终精度
-        self.ROBUSTNESS_SAMPLES_FINAL = 10
-        self.ROBUSTNESS_SAMPLES_SCREEN = 4
-        self.ROBUST_TOPK = 6  # 仅对 Top-K 候选做全量鲁棒性评估
-
-        # 综合评分权重（保持原先“模拟优先”的倾向）
-        self.GEO_WEIGHT = 0.3
-        self.SIM_WEIGHT = 0.7
+        # 分级评估策略：快速筛选用少量采样，最终决策用完整采样
+        self.SCREEN_SAMPLES = 4   # 快速筛选采样次数
+        self.FINAL_SAMPLES = 10   # 最终评估采样次数
+        
+        # 击球计数器（用于判断是否为开球）
+        self.shot_count = 0
 
         logger.info("NewAgent (优化版v3：几何瞄准+噪声鲁棒性评估) 已初始化")
     
     def _get_ball_position(self, ball):
         """获取球的2D位置"""
         return np.array([ball.state.rvw[0][0], ball.state.rvw[0][1]])
+    
+    def _is_break_state(self, balls):
+        """通过数量、位置和几何分布判断是否为开球状态（三角阵）
+        
+        标准三角阵特征：
+        - 15个球紧密排列
+        - 位置在球桌 (0.5w, 0.75l) 附近
+        - 包围盒尺寸约为 8R×4√3R ≈ 0.23m×0.20m
+        """
+        # 1. 数量检查：必须是15个球
+        live_balls = [b for bid, b in balls.items() if bid != 'cue' and b.state.s != 4]
+        if len(live_balls) != 15:
+            return False
+        
+        # 2. 获取所有球的位置
+        positions = [self._get_ball_position(b) for b in live_balls]
+        if not positions:
+            return False
+            
+        pos_array = np.array(positions)
+        
+        # 3. 计算球群中心位置
+        center = np.mean(pos_array, axis=0)
+        
+        # 4. 位置检查：标准三角阵的中心应该在球桌 (0.5w, 0.75l) 附近
+        # 球桌尺寸约为 1.0m × 2.0m，三角阵中心应该在 (0.5m, 1.5m) 附近
+        # 允许 ±0.3m 的误差（考虑到球可能轻微移动但仍然保持三角阵）
+        expected_x = 0.5  # 宽度中点（约0.5m）
+        expected_y = 1.5  # 长度75%处（约1.5m）
+        
+        center_deviation = np.linalg.norm(center - np.array([expected_x, expected_y]))
+        if center_deviation > 0.3:
+            logger.debug(f"[开球检测] 球群中心偏离过大: {center_deviation:.3f}m > 0.3m")
+            return False
+        
+        # 5. 尺寸检查：标准三角阵的包围盒应该很小
+        min_pos = np.min(pos_array, axis=0)
+        max_pos = np.max(pos_array, axis=0)
+        width = max_pos[0] - min_pos[0]
+        height = max_pos[1] - min_pos[1]
+        
+        # 标准三角阵：宽度 ≈ 8R = 0.2286m，高度 ≈ 4√3R = 0.1980m
+        # 考虑到 spacing_factor 和轻微移动，允许范围：宽度<0.35m，高度<0.30m
+        if width > 0.35 or height > 0.30:
+            logger.debug(f"[开球检测] 球群尺寸过大: 宽{width:.3f}m 高{height:.3f}m")
+            return False
+        
+        # 6. 密集度检查：计算平均球间距
+        # 标准三角阵中，相邻球的间距约为 2R = 0.0571m
+        distances = []
+        for i in range(len(positions)):
+            for j in range(i+1, len(positions)):
+                dist = np.linalg.norm(pos_array[i] - pos_array[j])
+                distances.append(dist)
+        
+        min_dist = np.min(distances)
+        avg_dist = np.mean(distances)
+        
+        # 如果最小球间距过大（>0.1m），说明球已经散开
+        # 如果平均球间距过大（>0.15m），说明不是紧密排列
+        if min_dist > 0.1 or avg_dist > 0.15:
+            logger.debug(f"[开球检测] 球间距过大: 最小{min_dist:.3f}m 平均{avg_dist:.3f}m")
+            return False
+        
+        logger.debug(f"[开球检测] 确认三角阵: 中心({center[0]:.2f},{center[1]:.2f}), "
+                    f"尺寸{width:.3f}×{height:.3f}m, 平均间距{avg_dist:.3f}m")
+        return True
+    
+    def _solve_break_shot(self, balls, table):
+        """专用开球策略：大力击打顶点球"""
+        cue_ball = balls.get('cue')
+        if cue_ball is None:
+            return self._random_action()
+            
+        cue_pos = self._get_ball_position(cue_ball)
+        
+        # 寻找顶点球（离白球最近的那个球，通常是1号）
+        min_dist = float('inf')
+        apex_ball = None
+        apex_ball_id = None
+        
+        for ball_id, ball in balls.items():
+            if ball_id == 'cue' or ball.state.s == 4:
+                continue
+            pos = self._get_ball_position(ball)
+            dist = self._calculate_distance(cue_pos, pos)
+            if dist < min_dist:
+                min_dist = dist
+                apex_ball = ball
+                apex_ball_id = ball_id
+        
+        if apex_ball is None:
+            return self._random_action()
+            
+        apex_pos = self._get_ball_position(apex_ball)
+        
+        # 计算正对角度
+        phi = self._calculate_shot_angle(cue_pos, apex_pos)
+        
+        # 开球参数：
+        # V0=7.8 (接近满力)
+        # b=-0.1 (微弱低杆/定杆，防止白球随后冲入球堆洗袋)
+        # theta=0 (平击)
+        action = {
+            'V0': 7.8,
+            'phi': phi,
+            'theta': 0.0,
+            'a': 0.0,
+            'b': -0.1
+        }
+        logger.info(f"[Break Shot] 锁定顶点球 {apex_ball_id}, 角度 {phi:.2f}, 大力冲球")
+        return action
     
     def _get_pocket_positions(self, table):
         """从球桌对象获取真实袋口位置"""
@@ -474,93 +556,6 @@ class NewAgent(Agent):
     def _calculate_distance(self, pos1, pos2):
         """计算两点间距离"""
         return np.linalg.norm(np.array(pos1) - np.array(pos2))
-
-    def _is_break_state(self, balls, my_targets):
-        """判断是否为开球局面（球仍在三角架紧密堆叠）。
-
-        说明：环境不会把 hit_count 传给 agent，因此只能从几何形态推断。
-        我们用“所有目标球均未进袋 + 15 颗彩球紧密聚类”的条件来识别开球。
-        """
-        try:
-            object_ids = [str(i) for i in range(1, 16)]
-            if 'cue' not in balls:
-                return False
-            if balls['cue'].state.s == 4:
-                return False
-            for bid in object_ids:
-                if bid not in balls or balls[bid].state.s == 4:
-                    return False
-
-            obj_positions = np.array([self._get_ball_position(balls[bid]) for bid in object_ids])
-            centroid = obj_positions.mean(axis=0)
-            bbox = obj_positions.max(axis=0) - obj_positions.min(axis=0)
-            bbox_diag = float(np.linalg.norm(bbox))
-            max_r = float(np.max(np.linalg.norm(obj_positions - centroid, axis=1)))
-
-            cue_pos = self._get_ball_position(balls['cue'])
-            cue_to_centroid = float(np.linalg.norm(cue_pos - centroid))
-
-            # 阈值取保守：开球时目标球团很紧、与白球距离较远。
-            # 若球已散开，bbox/max_r 会明显变大。
-            return (bbox_diag < 0.28) and (max_r < 0.18) and (cue_to_centroid > 0.45) and (my_targets != ['8'])
-        except Exception:
-            return False
-
-    def _break_decision(self, balls, my_targets, table):
-        """开球快速策略：少量候选 + 极少评估。
-
-        目标：避免在开球局面跑完整的 Top-K * 鲁棒评估流程。
-        关键：必须尽量保证首球合法（首碰必须落在 my_targets 内，且不能先碰 8）。
-        """
-        cue_pos = self._get_ball_position(balls['cue'])
-        object_ids = [str(i) for i in range(1, 16)]
-        obj_positions = np.array([self._get_ball_position(balls[bid]) for bid in object_ids])
-        rack_centroid = obj_positions.mean(axis=0)
-
-        base_phi = self._calculate_shot_angle(cue_pos, rack_centroid)
-
-        # 在 base_phi 附近搜索一个“首碰合法”的角度（几何预测，代价极低）
-        best_phi = None
-        best_delta = None
-        for delta in [0, -1.5, 1.5, -3, 3, -5, 5, -8, 8, -12, 12, -18, 18, -25, 25]:
-            phi = (base_phi + delta) % 360
-            first_contact = self._get_first_contact_ball(cue_pos, phi, balls)
-            if first_contact is None:
-                continue
-            if first_contact == '8' and my_targets != ['8']:
-                continue
-            if first_contact in my_targets:
-                best_phi = phi
-                best_delta = abs(delta)
-                break
-
-        if best_phi is None:
-            # 实在找不到就用 base_phi（仍比全量搜索快），后续用轻评估挑较安全力度
-            best_phi = base_phi
-            best_delta = None
-
-        # 少量力度候选（开球不需要精细调 a/b/theta）
-        candidates = []
-        for v0 in [5.8, 6.4, 7.0]:
-            candidates.append({'V0': v0, 'phi': best_phi, 'theta': 0.0, 'a': 0.0, 'b': 0.0})
-
-        # 轻量评估：只做一次无噪声仿真（开球不需要噪声鲁棒评估）
-        best_action = candidates[0]
-        best_score = -1e9
-        for action in candidates:
-            fast_score = self._simulate_and_evaluate(action, balls, my_targets, table, add_noise=False)
-            if fast_score <= -5000:
-                continue
-
-            if fast_score > best_score:
-                best_score = fast_score
-                best_action = action
-
-        logger.info(
-            f"[NewAgent] 开球策略: phi={best_action['phi']:.2f}, V0={best_action['V0']:.2f}" +
-            (f", delta={best_delta}" if best_delta is not None else "")
-        )
-        return best_action
     
     def _calculate_aim_point(self, target_pos, pocket_pos):
         """计算瞄准点（ghost ball position）"""
@@ -603,7 +598,7 @@ class NewAgent(Agent):
         return power * self.POWER_REDUCTION
     
     def _check_path_clear(self, start_pos, end_pos, balls, exclude_ids):
-        """检查路径上是否有障碍球"""
+        """检查路径上是否有障碍球（增强版：带安全余量）"""
         line_vec = np.array(end_pos) - np.array(start_pos)
         line_length = np.linalg.norm(line_vec)
         
@@ -611,6 +606,9 @@ class NewAgent(Agent):
             return True
         
         line_vec = line_vec / line_length
+        
+        # 安全余量系数：将障碍球的有效半径扩大10%，过滤太窄的路线
+        SAFETY_MARGIN = 1.1
         
         for ball_id, ball in balls.items():
             if ball_id in exclude_ids or ball.state.s == 4:
@@ -624,7 +622,9 @@ class NewAgent(Agent):
                 closest_point = np.array(start_pos) + line_vec * projection
                 distance = np.linalg.norm(ball_pos - closest_point)
                 
-                if distance < 2.2 * self.BALL_RADIUS:
+                # 使用扩大后的碰撞半径检测，提高安全性
+                collision_threshold = 2 * self.BALL_RADIUS * SAFETY_MARGIN
+                if distance < collision_threshold:
                     return False
         return True
     
@@ -936,56 +936,54 @@ class NewAgent(Agent):
             return -200
     
     def _evaluate_with_robustness(self, action, balls, my_targets, table, samples=None):
-        """带噪声的鲁棒性评估（多次采样取平均/最小值）
+        """带噪声的鲁棒性评估（优化版：支持分级评估和早停）
         
         对同一动作进行多次带噪声模拟，评估其在真实环境中的可靠性。
-        使用保守策略：如果有任何一次模拟出现严重犯规，大幅降低评分。
+        一票否决策略：发现任何致命错误立即返回-10000，不浪费计算资源。
+        
+        参数：
+            samples: 采样次数，None时使用FINAL_SAMPLES
         """
         if samples is None:
-            samples = self.ROBUSTNESS_SAMPLES_FINAL
-
+            samples = self.FINAL_SAMPLES
+        
         scores = []
-        fatal_errors = []  # 记录致命错误的具体得分
-
+        
         for i in range(samples):
             score = self._simulate_and_evaluate(action, balls, my_targets, table, add_noise=True)
-            scores.append(score)
             
-            # 统计致命错误（黑8误入、白球落袋）
-            if score <= -5000:  # 一票否决级别的错误
-                fatal_errors.append((i + 1, score))
-                # 早停：一旦出现致命错误，立即拒绝该动作（大幅加速失败候选的筛除）
-                logger.warning(
-                    f"[鲁棒性检测] 动作在第{i + 1}/{samples}次模拟出现致命错误: {score}，提前拒绝"
-                )
+            # 早停：发现致命错误立即终止，不再继续采样
+            if score <= -5000:  # 误进黑8、白球+黑8等致命错误
+                logger.warning(f"[鲁棒性检测] 第{i+1}/{samples}次模拟发现致命错误(得分={score})，立即终止")
                 return -10000
+            
+            scores.append(score)
         
-        # 保守策略：使用平均分和最低分的加权组合
-        # 这样既考虑平均表现，又惩罚高风险动作
+        # 没有致命错误，计算综合得分
         avg_score = np.mean(scores)
         min_score = np.min(scores)
         
-        # 60%平均分 + 40%最低分，更加保守（提高最低分权重）
+        # 60%平均分 + 40%最低分，保守策略
         robust_score = avg_score * 0.6 + min_score * 0.4
         
-        # 额外检查：如果有多次高风险错误（白球落袋、首球犯规等），大幅降低评分
-        high_risk_errors = sum(1 for s in scores if s <= -500)  # 包含白球落袋(-1000)和袋口危险
-        high_risk_threshold = max(2, int(math.ceil(samples * 0.2)))
+        # 高风险错误检测（白球落袋-1000、袋口危险等）
+        high_risk_errors = sum(1 for s in scores if s <= -500)
+        high_risk_threshold = max(1, samples // 5)  # 动态阈值：20%
         if high_risk_errors >= high_risk_threshold:
-            logger.warning(f"[鲁棒性检测] 动作有{high_risk_errors}/{samples}次高风险错误（≤-500），大幅降低评分")
-            robust_score -= 300  # 大幅惩罚
+            logger.warning(f"[鲁棒性检测] 动作有{high_risk_errors}/{samples}次高风险错误（≤-500）")
+            robust_score -= 300
         
-        # 中等风险错误检测
-        medium_risk_errors = sum(1 for s in scores if -500 < s <= -200)
-        medium_risk_threshold = max(4, int(math.ceil(samples * 0.4)))
+        # 中等风险错误检测（首球犯规、未碰库等）
+        medium_risk_errors = sum(1 for s in scores if -500 < s <= -150)
+        medium_risk_threshold = max(1, samples // 3)  # 动态阈值：30%
         if medium_risk_errors >= medium_risk_threshold:
-            logger.warning(f"[鲁棒性检测] 动作有{medium_risk_errors}/{samples}次中等错误（-500~-200），降低评分")
+            logger.warning(f"[鲁棒性检测] 动作有{medium_risk_errors}/{samples}次中等错误（-500~-150）")
             robust_score -= 150
         
         return robust_score
     
     def _find_best_shot(self, balls, my_targets, table):
-        """寻找最佳击球方案"""
+        """寻找最佳击球方案（优化版：Top-K筛选）"""
         cue_ball = balls.get('cue')
         if cue_ball is None or cue_ball.state.s == 4:
             return None, -1000, None
@@ -993,15 +991,11 @@ class NewAgent(Agent):
         cue_pos = self._get_ball_position(cue_ball)
         pockets = self._get_pocket_positions(table)
         
-        best_action = None
-        best_score = -1000
-        best_details = None
-
-        # 第一阶段：对全部候选做“快速单次仿真”筛选（不加噪声），减少昂贵的鲁棒评估次数
-        candidates = []
-        
         # 确定实际目标球（排除已进袋的）
         active_targets = [bid for bid in my_targets if balls[bid].state.s != 4]
+        
+        # 第一阶段：快速粗筛（无噪声单次模拟）
+        candidates = []  # (action, geo_score, quick_sim_score, details)
         
         for target_id in active_targets:
             target_ball = balls.get(target_id)
@@ -1016,7 +1010,7 @@ class NewAgent(Agent):
                     cue_pos, target_id, target_pos, pocket_pos, balls, my_targets
                 )
                 
-                if geo_score > best_score - 30:  # 只考虑较好的方案
+                if geo_score > -100:  # 只考虑几何上可行的方案
                     aim_point = self._calculate_aim_point(target_pos, pocket_pos)
                     if aim_point is None:
                         continue
@@ -1033,57 +1027,64 @@ class NewAgent(Agent):
                         'a': 0.0,
                         'b': 0.0
                     }
-
-                    # 快速单次仿真（不加噪声）用于筛选
-                    sim_score_fast = self._simulate_and_evaluate(action, balls, my_targets, table, add_noise=False)
-                    if sim_score_fast <= -5000:
-                        continue
-
-                    total_fast = geo_score * self.GEO_WEIGHT + sim_score_fast * self.SIM_WEIGHT
-                    candidates.append((total_fast, action, target_id, pocket_pos, geo_score, sim_score_fast))
-
+                    
+                    # 快速评估（无噪声）
+                    quick_score = self._simulate_and_evaluate(action, balls, my_targets, table, add_noise=False)
+                    
+                    # 过滤掉明显不可行的方案（致命错误）
+                    if quick_score > -5000:
+                        candidates.append((action, geo_score, quick_score, {
+                            'target_id': target_id,
+                            'pocket': pocket_pos
+                        }))
+        
         if not candidates:
             return None, -1000, None
-
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        top_candidates = candidates[: self.ROBUST_TOPK]
-
-        # 第二阶段：仅对 Top-K 做全量鲁棒评估，保持最终精度
-        for _, action, target_id, pocket_pos, geo_score, sim_score_fast in top_candidates:
-            sim_score_robust = self._evaluate_with_robustness(
-                action, balls, my_targets, table, samples=self.ROBUSTNESS_SAMPLES_FINAL
-            )
-            total_score = geo_score * self.GEO_WEIGHT + sim_score_robust * self.SIM_WEIGHT
-
+        
+        # 第二阶段：Top-K筛选，选出前6个候选
+        # 综合几何得分和快速模拟得分排序
+        candidates.sort(key=lambda x: x[1] * 0.3 + x[2] * 0.7, reverse=True)
+        top_k = candidates[:6]
+        
+        logger.info(f"[Top-K筛选] 从{len(candidates)}个候选中筛选出前{len(top_k)}个进行鲁棒性评估")
+        
+        # 第三阶段：对Top-K进行完整的鲁棒性评估
+        best_action = None
+        best_score = -1000
+        best_details = None
+        
+        for action, geo_score, quick_score, details in top_k:
+            # 使用鲁棒性评估（带噪声多次采样）
+            sim_score = self._evaluate_with_robustness(action, balls, my_targets, table, samples=self.FINAL_SAMPLES)
+            
+            # 综合评分
+            total_score = geo_score * 0.3 + sim_score * 0.7
+            
             if total_score > best_score:
                 best_score = total_score
                 best_action = action
                 best_details = {
-                    'target_id': target_id,
-                    'pocket': pocket_pos,
+                    'target_id': details['target_id'],
+                    'pocket': details['pocket'],
                     'geo_score': geo_score,
-                    'sim_score_fast': sim_score_fast,
-                    'sim_score': sim_score_robust,
+                    'sim_score': sim_score
                 }
         
         return best_action, best_score, best_details
     
     def _refine_shot_with_simulation(self, base_action, balls, my_targets, table):
-        """使用物理模拟微调击球参数（增强版：更多安全检查）"""
+        """使用物理模拟微调击球参数（优化版：分级评估）"""
+        # 先用少量采样评估基础动作
         best_action = base_action.copy()
-        # 微调阶段用更少采样做筛选（加速），最后对最优动作做全量采样复核（保精度）
-        best_score_screen = self._evaluate_with_robustness(
-            base_action, balls, my_targets, table, samples=self.ROBUSTNESS_SAMPLES_SCREEN
-        )
+        best_score = self._evaluate_with_robustness(base_action, balls, my_targets, table, samples=self.SCREEN_SAMPLES)
         
         cue_ball = balls.get('cue')
         if cue_ball:
             cue_pos = self._get_ball_position(cue_ball)
         else:
-            best_score_final = self._evaluate_with_robustness(
-                best_action, balls, my_targets, table, samples=self.ROBUSTNESS_SAMPLES_FINAL
-            )
-            return best_action, best_score_final
+            # 最终复核
+            final_score = self._evaluate_with_robustness(best_action, balls, my_targets, table, samples=self.FINAL_SAMPLES)
+            return best_action, final_score
         
         for i in range(self.SIMULATION_COUNT):
             # 微调参数（减小搜索范围以提高精度）
@@ -1116,23 +1117,19 @@ class NewAgent(Agent):
                 if first_contact is not None and first_contact != '8':
                     continue
             
-            # 使用筛选级鲁棒性评估（更少采样）
-            score_screen = self._evaluate_with_robustness(
-                test_action, balls, my_targets, table, samples=self.ROBUSTNESS_SAMPLES_SCREEN
-            )
+            # 使用快速筛选采样（SCREEN_SAMPLES）
+            score = self._evaluate_with_robustness(test_action, balls, my_targets, table, samples=self.SCREEN_SAMPLES)
             
-            if score_screen > best_score_screen:
+            if score > best_score:
                 best_action = test_action.copy()
-                best_score_screen = score_screen
-                logger.info(f"[NewAgent] 找到更优方案 (筛选鲁棒得分: {score_screen:.1f})")
-
-        best_score_final = self._evaluate_with_robustness(
-            best_action, balls, my_targets, table, samples=self.ROBUSTNESS_SAMPLES_FINAL
-        )
-        logger.info(
-            f"[NewAgent] 模拟优化完成 ({self.SIMULATION_COUNT}次搜索), 最终鲁棒得分: {best_score_final:.1f}"
-        )
-        return best_action, best_score_final
+                best_score = score
+                logger.info(f"[NewAgent] 找到更优方案 (快速得分: {score:.1f})")
+        
+        # 最终复核：用完整采样重新评估最佳动作
+        final_score = self._evaluate_with_robustness(best_action, balls, my_targets, table, samples=self.FINAL_SAMPLES)
+        logger.info(f"[NewAgent] 模拟优化完成 ({self.SIMULATION_COUNT}次搜索), 快速得分: {best_score:.1f}, 最终得分: {final_score:.1f}")
+        
+        return best_action, final_score
     
     def _try_kick_shot(self, balls, my_targets, table, cue_pos, active_targets):
         """尝试大力解球（Kick Shot）策略
@@ -1269,8 +1266,9 @@ class NewAgent(Agent):
                 # 验证这个击球 - 增加速度余量确保碰库
                 dist_to_target = self._calculate_distance(cue_pos, target_pos)
                 # 根据距离计算安全速度，确保有足够动能碰库
-                safe_v0 = max(2.5, 1.5 + dist_to_target * 1.2)  # 最低2.5，加距离补偿
-                safe_v0 = min(safe_v0, 4.0)  # 不要太大
+                # 提高最低速度和距离补偿系数
+                safe_v0 = max(3.0, 2.0 + dist_to_target * 1.5)  # 最低3.0，提高距离补偿
+                safe_v0 = min(safe_v0, 4.5)  # 上限稍微提高
                 
                 action = {
                     'V0': safe_v0,
@@ -1282,6 +1280,12 @@ class NewAgent(Agent):
                 
                 # 使用鲁棒性评估
                 score = self._evaluate_with_robustness(action, balls, my_targets, table)
+                
+                # 如果得分显示未碰库犯规风险高，增加20%力度重试
+                if -200 <= score < -100:  # 可能未碰库
+                    action['V0'] = min(safe_v0 * 1.2, 5.0)
+                    score = self._evaluate_with_robustness(action, balls, my_targets, table)
+                    logger.debug(f"[防守加强] 增加力度到 {action['V0']:.2f}, 新得分: {score:.1f}")
                 
                 if score > best_score:
                     best_score = score
@@ -1296,8 +1300,8 @@ class NewAgent(Agent):
                     if test_first == target_id:
                         # 增加速度余量确保碰库
                         dist_to_target = self._calculate_distance(cue_pos, target_pos)
-                        safe_v0 = max(2.5, 1.5 + dist_to_target * 1.2)
-                        safe_v0 = min(safe_v0, 4.0)
+                        safe_v0 = max(3.0, 2.0 + dist_to_target * 1.5)  # 提高最低速度
+                        safe_v0 = min(safe_v0, 4.5)
                         
                         action = {
                             'V0': safe_v0,
@@ -1308,6 +1312,12 @@ class NewAgent(Agent):
                         }
                         # 使用鲁棒性评估
                         score = self._evaluate_with_robustness(action, balls, my_targets, table)
+                        
+                        # 如果可能未碰库，增加力度重试
+                        if -200 <= score < -100:
+                            action['V0'] = min(safe_v0 * 1.2, 5.0)
+                            score = self._evaluate_with_robustness(action, balls, my_targets, table)
+                        
                         if score > best_score:
                             best_score = score
                             best_action = action
@@ -1321,7 +1331,7 @@ class NewAgent(Agent):
                 
                 if first_contact in active_targets:
                     action = {
-                        'V0': 2.8,  # 增加速度确保碰库
+                        'V0': 3.2,  # 增加速度确保碰库
                         'phi': test_phi,
                         'theta': 0.0,
                         'a': 0.0,
@@ -1329,6 +1339,12 @@ class NewAgent(Agent):
                     }
                     # 使用鲁棒性评估
                     score = self._evaluate_with_robustness(action, balls, my_targets, table)
+                    
+                    # 如果可能未碰库，增加力度重试
+                    if -200 <= score < -100:
+                        action['V0'] = 3.8  # 增加力度
+                        score = self._evaluate_with_robustness(action, balls, my_targets, table)
+                    
                     if score > best_score:
                         best_score = score
                         best_action = action
@@ -1397,24 +1413,32 @@ class NewAgent(Agent):
         return best_action
     
     def decision(self, balls=None, my_targets=None, table=None):
-        """主决策函数（增强版：更多安全验证）"""
+        """主决策函数（增强版：包含开球检测）"""
         if balls is None or my_targets is None or table is None:
             logger.warning("[NewAgent] 缺少必要信息，使用随机动作")
             return self._random_action()
         
         try:
-            # 开球局面：不值得跑完整在线搜索（会浪费大量时间）
-            if self._is_break_state(balls, my_targets):
-                logger.info("[NewAgent] 检测到开球局面，采用快速开球策略")
-                return self._break_decision(balls, my_targets, table)
-
+            # ============ 开球检测（自动重置计数器）============
+            # 如果检测到三角阵，说明是新开局，重置计数器
+            is_break = self._is_break_state(balls)
+            if is_break:
+                logger.info(f"[NewAgent] 检测到完美三角阵（新开局），重置击球计数器，执行专用开球策略")
+                self.shot_count = 0  # 重置计数器
+                self.shot_count += 1  # 标记本次为开球
+                return self._solve_break_shot(balls, table)
+            
+            # 更新击球计数（非开球状态）
+            self.shot_count += 1
+            # ================================================
+            
             # 检查是否需要打8号球
             remaining_own = [bid for bid in my_targets if bid != '8' and balls[bid].state.s != 4]
             if len(remaining_own) == 0:
                 my_targets = ["8"]
                 logger.info("[NewAgent] 目标球已清空，切换到8号球")
             
-            logger.info(f"[NewAgent] 开始决策，目标球: {my_targets}")
+            logger.info(f"[NewAgent] 开始决策（第{self.shot_count}次击球），目标球: {my_targets}")
             
             # 第一步：几何计算 + 物理验证找最佳方案
             base_action, base_score, details = self._find_best_shot(balls, my_targets, table)
