@@ -19,15 +19,19 @@ from agent import BasicAgent, NewAgent
 import time
 import logging
 from datetime import datetime
+import os
+
+# 确保logs目录存在
+os.makedirs('logs', exist_ok=True)
 
 # 配置评估日志 - 使用独立的logger避免被poolenv的basicConfig覆盖
-eval_log_filename = f"evaluate_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+eval_log_filename = "logs/evaluate.log"
 eval_logger = logging.getLogger('evaluate')
 eval_logger.setLevel(logging.INFO)
 eval_logger.propagate = False  # 不传播到root logger
 
-# 创建文件和控制台处理器
-file_handler = logging.FileHandler(eval_log_filename, encoding='utf-8')
+# 创建文件和控制台处理器（续写模式）
+file_handler = logging.FileHandler(eval_log_filename, mode='a', encoding='utf-8')
 stream_handler = logging.StreamHandler()
 
 # 设置格式
@@ -45,7 +49,7 @@ set_random_seed(enable=False, seed=42)
 
 env = PoolEnv()
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
-n_games = 15  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
+n_games = 2  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
 
 agent_a, agent_b = BasicAgent(), NewAgent()
 
@@ -236,11 +240,11 @@ eval_logger.info("")
 
 # 4. 每局详细信息
 eval_logger.info("【每局详细信息】")
-eval_logger.info(f"{'局号':<6} {'开球方':<12} {'胜者':<12} {'获胜原因':<30} {'用时(秒)':<10} {'击球数':<8}")
-eval_logger.info("-" * 90)
+eval_logger.info(f"{'局号':<6} {'开球方':<12} {'胜者':<12} {'获胜原因':<40} {'用时(秒)':<10} {'击球数':<8}")
+eval_logger.info("-" * 100)
 for detail in game_details:
     eval_logger.info(f"{detail['game_num']:<6} {detail['breaker']:<12} {detail['winner']:<12} "
-                    f"{detail['win_reason']:<30} {detail['duration']:<10.2f} {detail['hit_count']:<8}")
+                    f"{detail['win_reason']:<40} {detail['duration']:<10.2f} {detail['hit_count']:<8}")
 eval_logger.info("")
 
 # 5. 获胜原因统计

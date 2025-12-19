@@ -23,12 +23,15 @@ from datetime import datetime
 import random
 import logging
 
+# 确保logs目录存在
+os.makedirs('logs', exist_ok=True)
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("poolenv.log", encoding='utf-8'),
+        logging.FileHandler("logs/poolenv.log", encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
