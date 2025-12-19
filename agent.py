@@ -157,21 +157,21 @@ def analyze_shot_for_reward(shot: pt.System, last_state: dict, player_targets: l
     
     # 白球进袋处理
     if cue_pocketed and eight_pocketed:
-        score -= 150  # 白球+黑8同时进袋，严重犯规
+        score -= 5000  # 白球+黑8同时进袋，一票否决
     elif cue_pocketed:
-        score -= 100  # 白球进袋
+        score -= 1000  # 白球进袋（提高惩罚，与Agent评估一致）
     elif eight_pocketed:
         # 黑8进袋：只有清台后（player_targets == ['8']）才合法
         if player_targets == ['8']:
             score += 100  # 合法打进黑8
         else:
-            score -= 150  # 清台前误打黑8，判负
+            score -= 5000  # 清台前误打黑8，一票否决
             
     # 首球犯规和碰库犯规
     if foul_first_hit:
         score -= 30
     if foul_no_rail:
-        score -= 30
+        score -= 150  # 提高未碰库犯规惩罚
         
     # 进球得分（own_pocketed 已根据 player_targets 正确分类）
     score += len(own_pocketed) * 50
@@ -412,7 +412,17 @@ class NewAgent(Agent):
         self.SIMULATION_TIMEOUT = 2  # 单次模拟超时
         self.POWER_REDUCTION = 0.9  # 力度衰减系数，降低白球落袋概率
         
-        logger.info("NewAgent (优化版v2：几何瞄准+安全检查+防犯规) 已初始化")
+        # 噪声参数（与poolenv保持一致）
+        self.noise_std = {
+            'V0': 0.1,      # 速度标准差
+            'phi': 0.1,     # 水平角度标准差（度）
+            'theta': 0.1,   # 垂直角度标准差（度）
+            'a': 0.003,     # 横向偏移标准差
+            'b': 0.003      # 纵向偏移标准差
+        }
+        self.ROBUSTNESS_SAMPLES = 10  # 鲁棒性评估采样次数
+
+        logger.info("NewAgent (优化版v3：几何瞄准+噪声鲁棒性评估) 已初始化")
     
     def _get_ball_position(self, ball):
         """获取球的2D位置"""
@@ -646,20 +656,44 @@ class NewAgent(Agent):
         
         return score
     
-    def _simulate_and_evaluate(self, action, balls, my_targets, table):
-        """模拟击球并详细评估结果（增强版：更严格的犯规检测）"""
+    def _simulate_and_evaluate(self, action, balls, my_targets, table, add_noise=False):
+        """模拟击球并详细评估结果（增强版：支持噪声模拟）
+        
+        参数：
+            add_noise: 是否添加噪声模拟真实环境
+        """
         try:
             sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
             sim_table = copy.deepcopy(table)
             cue = pt.Cue(cue_ball_id="cue")
             
             shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+            
+            # 如果启用噪声，添加高斯扰动
+            if add_noise:
+                noisy_action = {
+                    'V0': action['V0'] + np.random.normal(0, self.noise_std['V0']),
+                    'phi': action['phi'] + np.random.normal(0, self.noise_std['phi']),
+                    'theta': action['theta'] + np.random.normal(0, self.noise_std['theta']),
+                    'a': action['a'] + np.random.normal(0, self.noise_std['a']),
+                    'b': action['b'] + np.random.normal(0, self.noise_std['b'])
+                }
+                # 限制参数在合理范围内
+                noisy_action['V0'] = np.clip(noisy_action['V0'], 0.5, 8.0)
+                noisy_action['phi'] = noisy_action['phi'] % 360
+                noisy_action['theta'] = np.clip(noisy_action['theta'], 0, 90)
+                noisy_action['a'] = np.clip(noisy_action['a'], -0.5, 0.5)
+                noisy_action['b'] = np.clip(noisy_action['b'], -0.5, 0.5)
+                actual_action = noisy_action
+            else:
+                actual_action = action
+            
             shot.cue.set_state(
-                V0=action['V0'],
-                phi=action['phi'],
-                theta=action['theta'],
-                a=action['a'],
-                b=action['b']
+                V0=actual_action['V0'],
+                phi=actual_action['phi'],
+                theta=actual_action['theta'],
+                a=actual_action['a'],
+                b=actual_action['b']
             )
             
             if not simulate_with_timeout(shot, timeout=self.SIMULATION_TIMEOUT):
@@ -678,15 +712,15 @@ class NewAgent(Agent):
             # 严重犯规检查 - 白球落袋
             if 'cue' in new_pocketed:
                 if '8' in new_pocketed:
-                    return -600  # 白球+黑8同时进袋，极度严重
-                return -250  # 白球进袋
+                    return -10000  # 白球+黑8同时进袋，一票否决，绝对禁止
+                return -1000  # 白球进袋（大幅提高惩罚，活着比进球重要）
             
-            # 黑8处理
+            # 黑8处理 - 一票否决制
             if '8' in new_pocketed:
                 if should_hit_eight:
                     return 250  # 合法打进黑8，获胜！
                 else:
-                    return -600  # 误打黑8，直接判负，最严重的错误
+                    return -10000  # 误打黑8，一票否决，绝对禁止执行此动作
             
             # 首球犯规检查（最重要的检查）
             first_contact_ball_id = None
@@ -732,15 +766,96 @@ class NewAgent(Agent):
             score += len(own_pocketed) * 100  # 提高进球奖励
             score -= len(enemy_pocketed) * 40
             
-            # 无进球但合法
+            # 未进球时检查碰库（关键！）
+            if len(new_pocketed) == 0:
+                cue_hit_cushion = False
+                target_hit_cushion = False
+                
+                for e in shot.events:
+                    et = str(e.event_type).lower()
+                    ids = list(e.ids) if hasattr(e, 'ids') else []
+                    if 'cushion' in et:
+                        if 'cue' in ids:
+                            cue_hit_cushion = True
+                        if first_contact_ball_id is not None and first_contact_ball_id in ids:
+                            target_hit_cushion = True
+                
+                # 未进球且未碰库 = 犯规
+                if first_contact_ball_id is not None and not cue_hit_cushion and not target_hit_cushion:
+                    score -= 200  # 严厉惩罚未碰库犯规
+            
+            # 无进球但合法（碰库了）
             if score == 0 and 'cue' not in new_pocketed and '8' not in new_pocketed:
                 score = 10
+            
+            # 袋口斥力场检测：白球停在袋口边缘是极度危险的
+            if 'cue' not in new_pocketed and 'cue' in sim_balls:
+                cue_final_pos = self._get_ball_position(sim_balls['cue'])
+                pockets = self._get_pocket_positions(sim_table)
+                
+                min_pocket_dist = float('inf')
+                for pocket_pos in pockets:
+                    dist = self._calculate_distance(cue_final_pos, pocket_pos)
+                    if dist < min_pocket_dist:
+                        min_pocket_dist = dist
+                
+                # 袋口危险区域：1.5倍球半径以内
+                danger_radius = 1.5 * self.BALL_RADIUS
+                if min_pocket_dist < danger_radius:
+                    # 距离越近惩罚越重
+                    danger_penalty = int(500 * (1 - min_pocket_dist / danger_radius))
+                    score -= danger_penalty
+                    logger.debug(f"[袋口斥力] 白球距袋口 {min_pocket_dist*1000:.1f}mm，扣除 {danger_penalty} 分")
             
             return score
             
         except Exception as e:
             logger.error(f"[NewAgent] 模拟失败: {e}")
             return -200
+    
+    def _evaluate_with_robustness(self, action, balls, my_targets, table):
+        """带噪声的鲁棒性评估（多次采样取平均/最小值）
+        
+        对同一动作进行多次带噪声模拟，评估其在真实环境中的可靠性。
+        使用保守策略：如果有任何一次模拟出现严重犯规，大幅降低评分。
+        """
+        scores = []
+        fatal_errors = []  # 记录致命错误的具体得分
+        
+        for i in range(self.ROBUSTNESS_SAMPLES):
+            score = self._simulate_and_evaluate(action, balls, my_targets, table, add_noise=True)
+            scores.append(score)
+            
+            # 统计致命错误（黑8误入、白球落袋）
+            if score <= -5000:  # 一票否决级别的错误
+                fatal_errors.append((i+1, score))
+        
+        # 一票否决：只要有1次致命错误，直接拒绝该动作
+        if len(fatal_errors) > 0:
+            logger.warning(f"[鲁棒性检测] 动作在{len(fatal_errors)}/{self.ROBUSTNESS_SAMPLES}次模拟中出现致命错误: {fatal_errors[:3]}")
+            return -10000
+        
+        # 保守策略：使用平均分和最低分的加权组合
+        # 这样既考虑平均表现，又惩罚高风险动作
+        avg_score = np.mean(scores)
+        min_score = np.min(scores)
+        
+        # 60%平均分 + 40%最低分，更加保守（提高最低分权重）
+        robust_score = avg_score * 0.6 + min_score * 0.4
+        
+        # 额外检查：如果有多次高风险错误（白球落袋、首球犯规等），大幅降低评分
+        high_risk_errors = sum(1 for s in scores if s <= -500)  # 包含白球落袋(-1000)和袋口危险
+        if high_risk_errors >= 2:  # 20次中有2次高风险（10%概率）就拒绝
+            logger.warning(f"[鲁棒性检测] 动作有{high_risk_errors}/{self.ROBUSTNESS_SAMPLES}次高风险错误（≤-500），大幅降低评分")
+            robust_score -= 300  # 大幅惩罚
+        
+        # 中等风险错误检测
+        medium_risk_errors = sum(1 for s in scores if -500 < s <= -200)
+        if medium_risk_errors >= 4:  # 20次中有4次中等错误（20%概率）
+            logger.warning(f"[鲁棒性检测] 动作有{medium_risk_errors}/{self.ROBUSTNESS_SAMPLES}次中等错误（-500~-200），降低评分")
+            robust_score -= 150
+        
+        return robust_score
     
     def _find_best_shot(self, balls, my_targets, table):
         """寻找最佳击球方案"""
@@ -789,8 +904,8 @@ class NewAgent(Agent):
                         'b': 0.0
                     }
                     
-                    # 物理模拟验证
-                    sim_score = self._simulate_and_evaluate(action, balls, my_targets, table)
+                    # 使用鲁棒性评估（带噪声多次采样）
+                    sim_score = self._evaluate_with_robustness(action, balls, my_targets, table)
                     
                     # 综合评分
                     total_score = geo_score * 0.3 + sim_score * 0.7
@@ -810,7 +925,7 @@ class NewAgent(Agent):
     def _refine_shot_with_simulation(self, base_action, balls, my_targets, table):
         """使用物理模拟微调击球参数（增强版：更多安全检查）"""
         best_action = base_action.copy()
-        best_score = self._simulate_and_evaluate(base_action, balls, my_targets, table)
+        best_score = self._evaluate_with_robustness(base_action, balls, my_targets, table)
         
         cue_ball = balls.get('cue')
         if cue_ball:
@@ -849,18 +964,116 @@ class NewAgent(Agent):
                 if first_contact is not None and first_contact != '8':
                     continue
             
-            score = self._simulate_and_evaluate(test_action, balls, my_targets, table)
+            # 使用鲁棒性评估
+            score = self._evaluate_with_robustness(test_action, balls, my_targets, table)
             
             if score > best_score:
                 best_action = test_action.copy()
                 best_score = score
-                logger.info(f"[NewAgent] 找到更优方案 (得分: {score:.1f})")
+                logger.info(f"[NewAgent] 找到更优方案 (鲁棒得分: {score:.1f})")
         
-        logger.info(f"[NewAgent] 模拟优化完成 ({self.SIMULATION_COUNT}次搜索), 最终得分: {best_score:.1f}")
+        logger.info(f"[NewAgent] 模拟优化完成 ({self.SIMULATION_COUNT}次搜索), 最终鲁棒得分: {best_score:.1f}")
         return best_action, best_score
     
+    def _try_kick_shot(self, balls, my_targets, table, cue_pos, active_targets):
+        """尝试大力解球（Kick Shot）策略
+        
+        当常规防守无法找到安全方案时，尝试用大力击球依靠复杂碰撞创造机会。
+        关键：必须确保首球合法，即使后续轨迹复杂也要遵守规则。
+        """
+        logger.info("[NewAgent] 尝试大力解球策略（Kick Shot）")
+        
+        best_kick = None
+        best_kick_score = -1000
+        
+        # 策略1：向最近的合法目标球大力击打，依靠多次碰撞和碰库
+        for target_id in active_targets:
+            target_ball = balls.get(target_id)
+            if target_ball is None or target_ball.state.s == 4:
+                continue
+            
+            target_pos = self._get_ball_position(target_ball)
+            phi = self._calculate_shot_angle(cue_pos, target_pos)
+            
+            # 验证首球合法性
+            first_contact = self._get_first_contact_ball(cue_pos, phi, balls)
+            if first_contact != target_id:
+                continue  # 首球不合法，跳过
+            
+            # 大力击球：V0 = 5.0~6.5，制造复杂局面
+            for v0 in [5.0, 5.5, 6.0, 6.5]:
+                # 微调角度，避免直接进袋白球
+                for delta_phi in [0, -3, 3, -6, 6]:
+                    test_phi = (phi + delta_phi) % 360
+                    test_first = self._get_first_contact_ball(cue_pos, test_phi, balls)
+                    
+                    if test_first != target_id:
+                        continue  # 首球不合法
+                    
+                    kick_action = {
+                        'V0': v0,
+                        'phi': test_phi,
+                        'theta': np.random.uniform(0, 8),  # 轻微跳球增加不可预测性
+                        'a': 0.0,
+                        'b': 0.0
+                    }
+                    
+                    # 使用鲁棒性评估（但降低标准，只要不致命即可）
+                    score = self._evaluate_with_robustness(kick_action, balls, my_targets, table)
+                    
+                    # 大力解球的接受标准：不出现致命错误即可
+                    if score > -5000 and score > best_kick_score:
+                        best_kick = kick_action
+                        best_kick_score = score
+                        logger.info(f"[Kick Shot] 找到可行方案: V0={v0:.1f}, phi={test_phi:.1f}, 得分={score:.1f}")
+        
+        # 策略2：如果直线大力不行，尝试碰库后击打（Bank Shot）
+        if best_kick is None or best_kick_score < -200:
+            logger.info("[NewAgent] 尝试碰库解球（Bank Shot）")
+            # 尝试向球台边缘方向大力击打，利用碰库改变轨迹
+            pockets = self._get_pocket_positions(table)
+            for pocket_pos in pockets:
+                # 计算朝向袋口附近（但不是直接瞄准）的角度
+                direction = np.array(pocket_pos) - np.array(cue_pos)
+                base_phi = np.degrees(np.arctan2(direction[1], direction[0]))
+                if base_phi < 0:
+                    base_phi += 360
+                
+                # 偏移角度确保会碰库
+                for offset in [-25, -20, -15, 15, 20, 25]:
+                    test_phi = (base_phi + offset) % 360
+                    first_contact = self._get_first_contact_ball(cue_pos, test_phi, balls)
+                    
+                    # 检查首球合法性
+                    if first_contact is not None and first_contact not in active_targets:
+                        continue
+                    
+                    bank_action = {
+                        'V0': 5.5,  # 中等偏大力度
+                        'phi': test_phi,
+                        'theta': 5.0,  # 轻微跳球
+                        'a': 0.0,
+                        'b': -0.1  # 轻微低杆，增加碰库后效果
+                    }
+                    
+                    score = self._evaluate_with_robustness(bank_action, balls, my_targets, table)
+                    
+                    if score > -5000 and score > best_kick_score:
+                        best_kick = bank_action
+                        best_kick_score = score
+                        logger.info(f"[Bank Shot] 找到可行方案: phi={test_phi:.1f}, 得分={score:.1f}")
+                        break  # 找到一个就够了
+        
+        if best_kick is not None:
+            logger.info(f"[NewAgent] 采用大力解球，预期得分: {best_kick_score:.1f}")
+            return best_kick
+        
+        return None
+    
     def _get_safe_shot(self, balls, my_targets, table):
-        """生成安全的防守击球（增强版：确保首球合法）"""
+        """生成安全的防守击球（增强版v2：设置防守底线，绝境时大力解球）"""
+        SAFE_SHOT_THRESHOLD = -50  # 防守底线：低于此分数的动作视为不可接受
+        
         cue_ball = balls.get('cue')
         if cue_ball is None:
             return self._random_action()
@@ -894,16 +1107,22 @@ class NewAgent(Agent):
             
             # 如果首球就是目标球，这是安全的
             if first_contact == target_id:
-                # 验证这个击球
+                # 验证这个击球 - 增加速度余量确保碰库
+                dist_to_target = self._calculate_distance(cue_pos, target_pos)
+                # 根据距离计算安全速度，确保有足够动能碰库
+                safe_v0 = max(2.5, 1.5 + dist_to_target * 1.2)  # 最低2.5，加距离补偿
+                safe_v0 = min(safe_v0, 4.0)  # 不要太大
+                
                 action = {
-                    'V0': 1.8,  # 轻力度
+                    'V0': safe_v0,
                     'phi': phi,
                     'theta': 0.0,
                     'a': 0.0,
                     'b': 0.0
                 }
                 
-                score = self._simulate_and_evaluate(action, balls, my_targets, table)
+                # 使用鲁棒性评估
+                score = self._evaluate_with_robustness(action, balls, my_targets, table)
                 
                 if score > best_score:
                     best_score = score
@@ -916,14 +1135,20 @@ class NewAgent(Agent):
                     test_first = self._get_first_contact_ball(cue_pos, test_phi, balls)
                     
                     if test_first == target_id:
+                        # 增加速度余量确保碰库
+                        dist_to_target = self._calculate_distance(cue_pos, target_pos)
+                        safe_v0 = max(2.5, 1.5 + dist_to_target * 1.2)
+                        safe_v0 = min(safe_v0, 4.0)
+                        
                         action = {
-                            'V0': 1.8,
+                            'V0': safe_v0,
                             'phi': test_phi,
                             'theta': 0.0,
                             'a': 0.0,
                             'b': 0.0
                         }
-                        score = self._simulate_and_evaluate(action, balls, my_targets, table)
+                        # 使用鲁棒性评估
+                        score = self._evaluate_with_robustness(action, balls, my_targets, table)
                         if score > best_score:
                             best_score = score
                             best_action = action
@@ -937,13 +1162,14 @@ class NewAgent(Agent):
                 
                 if first_contact in active_targets:
                     action = {
-                        'V0': 1.5,
+                        'V0': 2.8,  # 增加速度确保碰库
                         'phi': test_phi,
                         'theta': 0.0,
                         'a': 0.0,
                         'b': 0.0
                     }
-                    score = self._simulate_and_evaluate(action, balls, my_targets, table)
+                    # 使用鲁棒性评估
+                    score = self._evaluate_with_robustness(action, balls, my_targets, table)
                     if score > best_score:
                         best_score = score
                         best_action = action
@@ -963,16 +1189,50 @@ class NewAgent(Agent):
             if nearest_target:
                 target_pos = self._get_ball_position(balls[nearest_target])
                 phi = self._calculate_shot_angle(cue_pos, target_pos)
-                best_action = {
-                    'V0': 1.2,  # 极轻力度
+                dist_to_target = self._calculate_distance(cue_pos, target_pos)
+                # 确保足够速度碰库
+                safe_v0 = max(2.5, 1.5 + dist_to_target * 1.2)
+                safe_v0 = min(safe_v0, 4.0)
+                
+                fallback_action = {
+                    'V0': safe_v0,
                     'phi': phi,
                     'theta': 0.0,
                     'a': 0.0,
                     'b': 0.0
                 }
-                best_score = -100
+                # 必须对后备方案进行鲁棒性评估，防止误打黑8
+                fallback_score = self._evaluate_with_robustness(fallback_action, balls, my_targets, table)
+                
+                # 只有在评估通过时才使用这个后备方案
+                if fallback_score > best_score:
+                    best_action = fallback_action
+                    best_score = fallback_score
+                
+                # 如果后备方案也失败（如误打黑8），返回随机动作
+                if best_action is None or best_score <= -5000:
+                    logger.warning("[NewAgent] 后备方案也不安全，使用随机动作")
+                    return self._random_action()
             else:
                 return self._random_action()
+        
+        # 防守底线检查：如果最佳防守得分太低（大概率犯规），尝试大力解球
+        if best_action is not None and best_score < SAFE_SHOT_THRESHOLD:
+            logger.warning(f"[NewAgent] 防守得分过低 ({best_score:.1f} < {SAFE_SHOT_THRESHOLD})，尝试大力解球策略")
+            kick_action = self._try_kick_shot(balls, my_targets, table, cue_pos, active_targets)
+            if kick_action is not None:
+                return kick_action
+            # 大力解球也失败，返回随机动作
+            logger.warning("[NewAgent] 大力解球也未找到合法方案，使用随机动作")
+            return self._random_action()
+        
+        # 最终安全检查：确保返回的动作是经过验证的
+        if best_action is None or best_score <= -5000:
+            logger.warning(f"[NewAgent] 所有安全策略都失败 (best_score={best_score:.1f})，尝试大力解球")
+            kick_action = self._try_kick_shot(balls, my_targets, table, cue_pos, active_targets)
+            if kick_action is not None:
+                return kick_action
+            return self._random_action()
         
         logger.info(f"[NewAgent] 使用安全击球策略，预期得分: {best_score:.1f}")
         return best_action
