@@ -45,7 +45,7 @@ set_random_seed(enable=False, seed=42)
 
 env = PoolEnv()
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
-n_games = 1  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
+n_games = 15  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
 
 agent_a, agent_b = BasicAgent(), NewAgent()
 
@@ -123,11 +123,13 @@ for i in range(n_games):
             game_times.append(game_duration)
             
             # 确定获胜原因 - 使用保存的last_step_info
+            # 注意：必须使用 == True 来严格判断，因为 get() 可能返回 None
             if info['winner'] == 'SAME':
                 win_reason = "平局（超过最大回合数）"
-            elif last_step_info.get('WHITE_BALL_INTO_POCKET') and last_step_info.get('BLACK_BALL_INTO_POCKET'):
+            elif (last_step_info.get('WHITE_BALL_INTO_POCKET') == True and 
+                  last_step_info.get('BLACK_BALL_INTO_POCKET') == True):
                 win_reason = "对手白球+黑8同时进袋"
-            elif last_step_info.get('BLACK_BALL_INTO_POCKET'):
+            elif last_step_info.get('BLACK_BALL_INTO_POCKET') == True:
                 # 检查是否合法打进黑8（通过判断winner是否是打球方）
                 # 如果黑8进袋且当前winner不是打球方，说明是非法打进
                 current_player = player  # 最后打球的是谁（循环中的player）
@@ -136,13 +138,13 @@ for i in range(n_games):
                     win_reason = "合法打进黑8"
                 else:
                     win_reason = "对手非法打进黑8"
-            elif last_step_info.get('WHITE_BALL_INTO_POCKET'):
+            elif last_step_info.get('WHITE_BALL_INTO_POCKET') == True:
                 win_reason = "对手白球进袋犯规（关键时刻）"
-            elif last_step_info.get('NO_HIT'):
+            elif last_step_info.get('NO_HIT') == True:
                 win_reason = "对手白球未接触任何球犯规"
-            elif last_step_info.get('FOUL_FIRST_HIT'):
+            elif last_step_info.get('FOUL_FIRST_HIT') == True:
                 win_reason = "对手首次接触违规球犯规"
-            elif last_step_info.get('NO_POCKET_NO_RAIL'):
+            elif last_step_info.get('NO_POCKET_NO_RAIL') == True:
                 win_reason = "对手无进球且未碰库犯规"
             else:
                 win_reason = "对手犯规或其他原因"
