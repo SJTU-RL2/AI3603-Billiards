@@ -421,8 +421,8 @@ class NewAgent(Agent):
             'b': 0.003      # 纵向偏移标准差
         }
         # 分级评估策略：快速筛选用少量采样，最终决策用完整采样
-        self.SCREEN_SAMPLES = 4   # 快速筛选采样次数
-        self.FINAL_SAMPLES = 10   # 最终评估采样次数
+        self.SCREEN_SAMPLES = 5   # 快速筛选采样次数
+        self.FINAL_SAMPLES = 15   # 最终评估采样次数
         
         # 击球计数器（用于判断是否为开球）
         self.shot_count = 0
@@ -500,50 +500,126 @@ class NewAgent(Agent):
                     f"尺寸{width:.3f}×{height:.3f}m, 平均间距{avg_dist:.3f}m")
         return True
     
-    def _solve_break_shot(self, balls, table):
-        """专用开球策略：大力击打顶点球"""
+    def _break_decision(self, balls, my_targets, table):
+        """智能开球策略：基于几何验证的安全爆破
+        
+        核心思路：
+        1. 瞄准球堆质心（而非最近球）- 确保动能均匀传递
+        2. 扇形扫描 + 合法性过滤 - 确保首球不是黑8或对方球
+        3. 低杆刹车 - 防止白球跟随球堆洗袋
+        4. 快速决策 - 找到合法角度后仅需少量验证
+        """
         cue_ball = balls.get('cue')
         if cue_ball is None:
             return self._random_action()
             
         cue_pos = self._get_ball_position(cue_ball)
         
-        # 寻找顶点球（离白球最近的那个球，通常是1号）
-        min_dist = float('inf')
-        apex_ball = None
-        apex_ball_id = None
+        # ============ 1. 计算球堆质心（几何中心）============
+        target_positions = []
+        all_ball_ids = []  # 记录所有球的ID用于后续判断
         
         for ball_id, ball in balls.items():
             if ball_id == 'cue' or ball.state.s == 4:
                 continue
-            pos = self._get_ball_position(ball)
-            dist = self._calculate_distance(cue_pos, pos)
-            if dist < min_dist:
-                min_dist = dist
-                apex_ball = ball
-                apex_ball_id = ball_id
+            target_positions.append(self._get_ball_position(ball))
+            all_ball_ids.append(ball_id)
         
-        if apex_ball is None:
+        if not target_positions:
             return self._random_action()
+        
+        # 球堆质心
+        centroid = np.mean(target_positions, axis=0)
+        
+        # 计算朝向质心的基础角度
+        base_phi = self._calculate_shot_angle(cue_pos, centroid)
+        
+        # ============ 2. 确定合法目标集合 ============
+        # 开球时的合法目标：己方球（不含黑8）
+        remaining_own = [bid for bid in my_targets if bid != '8' and balls[bid].state.s != 4]
+        
+        # 如果已经清台了（不太可能在开球时发生，但做保护）
+        if len(remaining_own) == 0:
+            valid_first_contact = {'8'}  # 只剩黑8
+        else:
+            valid_first_contact = set(remaining_own)  # 己方球（不含黑8）
+        
+        logger.info(f"[Break] 球堆质心: ({centroid[0]:.3f}, {centroid[1]:.3f}), "
+                   f"基础角度: {base_phi:.2f}°")
+        logger.info(f"[Break] 合法首球目标: {valid_first_contact}")
+        
+        # ============ 3. 扇形扫描：在基础角度附近搜索合法角度 ============
+        # 搜索范围：从中心向两侧扩展，优先选择偏移小的角度
+        # 范围: 0°, ±1°, ±2°, ±3°, ±5°, ±8°, ±12°
+        search_offsets = [0.0]
+        for delta in [1.0, 2.0, 3.0, 5.0, 8.0, 12.0]:
+            search_offsets.extend([delta, -delta])
+        
+        best_action = None
+        best_offset = None
+        
+        for offset in search_offsets:
+            test_phi = (base_phi + offset) % 360
             
-        apex_pos = self._get_ball_position(apex_ball)
+            # 几何预判：预测首球
+            first_contact = self._get_first_contact_ball(cue_pos, test_phi, balls)
+            
+            # ============ 4. 合法性过滤（安全锁）============
+            if first_contact is None:
+                logger.debug(f"[Break Scan] φ={test_phi:.1f}° (偏移{offset:+.1f}°): 无法预测首球，跳过")
+                continue
+            
+            # 检查首球是否在合法集合中
+            if first_contact not in valid_first_contact:
+                logger.debug(f"[Break Scan] φ={test_phi:.1f}° (偏移{offset:+.1f}°): "
+                           f"首球={first_contact} 不合法，跳过")
+                continue
+            
+            # ============ 5. 找到合法角度！构建动作 ============
+            # 力度: 6.5~7.5 m/s（大力但不满力，避免失控）
+            # 低杆: b=-0.15（刹车杆法，防止白球跟随洗袋）
+            # 平击: theta=0
+            candidate_action = {
+                'V0': np.random.uniform(6.8, 7.6),
+                'phi': test_phi,
+                'theta': 0.0,
+                'a': 0.0,
+                'b': -0.15  # 低杆刹车
+            }
+            
+            # ============ 6. 快速验证（1-2次模拟）============
+            # 只需确认不会直接导致致命错误（白球+黑8同时进袋等）
+            is_safe = True
+            for _ in range(2):
+                score = self._simulate_and_evaluate(
+                    candidate_action, balls, my_targets, table, add_noise=True
+                )
+                # 致命错误检测：误进黑8、白球+黑8同时进袋
+                if score <= -5000:
+                    is_safe = False
+                    logger.debug(f"[Break Verify] φ={test_phi:.1f}°: 验证失败(得分={score})")
+                    break
+            
+            if is_safe:
+                best_action = candidate_action
+                best_offset = offset
+                logger.info(f"[Break] ✓ 选定角度 φ={test_phi:.1f}° (偏移{offset:+.1f}°), "
+                           f"首球={first_contact}, V0={candidate_action['V0']:.2f}, b={candidate_action['b']}")
+                break  # 找到第一个安全角度就停止
         
-        # 计算正对角度
-        phi = self._calculate_shot_angle(cue_pos, apex_pos)
+        # ============ 7. 降级策略 ============
+        if best_action is None:
+            # 所有角度都不合法或验证失败，降级到质心直击
+            logger.warning("[Break] 未找到完全合法的角度，使用质心直击（风险策略）")
+            best_action = {
+                'V0': 7.0,
+                'phi': base_phi,
+                'theta': 0.0,
+                'a': 0.0,
+                'b': -0.15
+            }
         
-        # 开球参数：
-        # V0=7.8 (接近满力)
-        # b=-0.1 (微弱低杆/定杆，防止白球随后冲入球堆洗袋)
-        # theta=0 (平击)
-        action = {
-            'V0': 7.8,
-            'phi': phi,
-            'theta': 0.0,
-            'a': 0.0,
-            'b': -0.1
-        }
-        logger.info(f"[Break Shot] 锁定顶点球 {apex_ball_id}, 角度 {phi:.2f}, 大力冲球")
-        return action
+        return best_action
     
     def _get_pocket_positions(self, table):
         """从球桌对象获取真实袋口位置"""
@@ -1383,32 +1459,36 @@ class NewAgent(Agent):
                 if fallback_score > best_score:
                     best_action = fallback_action
                     best_score = fallback_score
-                
-                # 如果后备方案也失败（如误打黑8），返回随机动作
-                if best_action is None or best_score <= -5000:
-                    logger.warning("[NewAgent] 后备方案也不安全，使用随机动作")
-                    return self._random_action()
-            else:
-                return self._random_action()
         
-        # 防守底线检查：如果最佳防守得分太低（大概率犯规），尝试大力解球
-        if best_action is not None and best_score < SAFE_SHOT_THRESHOLD:
-            logger.warning(f"[NewAgent] 防守得分过低 ({best_score:.1f} < {SAFE_SHOT_THRESHOLD})，尝试大力解球策略")
+        # ============ 最终安全检查与决策 ============
+        # 情况1: 没有找到任何可行方案
+        if best_action is None:
+            logger.warning("[NewAgent] 完全无法找到可行方案，尝试大力解球")
             kick_action = self._try_kick_shot(balls, my_targets, table, cue_pos, active_targets)
             if kick_action is not None:
                 return kick_action
-            # 大力解球也失败，返回随机动作
-            logger.warning("[NewAgent] 大力解球也未找到合法方案，使用随机动作")
+            logger.warning("[NewAgent] 大力解球也失败，使用随机动作")
             return self._random_action()
         
-        # 最终安全检查：确保返回的动作是经过验证的
-        if best_action is None or best_score <= -5000:
-            logger.warning(f"[NewAgent] 所有安全策略都失败 (best_score={best_score:.1f})，尝试大力解球")
+        # 情况2: 找到了方案，但得分极低（致命错误）
+        if best_score <= -5000:
+            logger.warning(f"[NewAgent] 最佳方案有致命错误 (得分={best_score:.1f})，尝试大力解球")
             kick_action = self._try_kick_shot(balls, my_targets, table, cue_pos, active_targets)
             if kick_action is not None:
                 return kick_action
+            logger.warning("[NewAgent] 大力解球也失败，使用随机动作")
             return self._random_action()
         
+        # 情况3: 找到了方案，但得分低于防守底线（高风险）
+        if best_score < SAFE_SHOT_THRESHOLD:
+            logger.warning(f"[NewAgent] 防守得分低于底线 ({best_score:.1f} < {SAFE_SHOT_THRESHOLD})，尝试大力解球")
+            kick_action = self._try_kick_shot(balls, my_targets, table, cue_pos, active_targets)
+            if kick_action is not None:
+                return kick_action
+            # 大力解球也失败，使用原防守方案（虽然得分低但至少不是致命错误）
+            logger.warning(f"[NewAgent] 大力解球失败，使用原防守方案 (得分={best_score:.1f})")
+        
+        # 情况4: 找到了可接受的方案
         logger.info(f"[NewAgent] 使用安全击球策略，预期得分: {best_score:.1f}")
         return best_action
     
@@ -1423,10 +1503,10 @@ class NewAgent(Agent):
             # 如果检测到三角阵，说明是新开局，重置计数器
             is_break = self._is_break_state(balls)
             if is_break:
-                logger.info(f"[NewAgent] 检测到完美三角阵（新开局），重置击球计数器，执行专用开球策略")
+                logger.info(f"[NewAgent] 检测到完美三角阵（新开局），重置击球计数器，执行智能开球策略")
                 self.shot_count = 0  # 重置计数器
                 self.shot_count += 1  # 标记本次为开球
-                return self._solve_break_shot(balls, table)
+                return self._break_decision(balls, my_targets, table)
             
             # 更新击球计数（非开球状态）
             self.shot_count += 1
