@@ -1114,7 +1114,7 @@ class NewAgent(Agent):
             candidates.sort(key=lambda x: x[1] * 0.3 + x[2] * 0.7, reverse=True)
             best_direct_score = candidates[0][1] * 0.3 + candidates[0][2] * 0.7
         
-        if not candidates or best_direct_score < 50:
+        if not candidates or best_direct_score < 80:
             logger.info(f"[_find_best_shot] 直线打击方案不佳(最高分={best_direct_score:.1f})，尝试撞库打击")
             kick_candidates = self._generate_kick_shot_candidates(balls, my_targets, table, cue_pos, active_targets, pockets)
             candidates.extend(kick_candidates)
@@ -1298,7 +1298,7 @@ class NewAgent(Agent):
         return None
     
     def _refine_shot_with_simulation(self, base_action, balls, my_targets, table, initial_score=None):
-        """使用物理模拟微调击球参数（优化版：分级评估）
+        """使用物理模拟微调击球参数（优化版：分级评估 + 回退机制）
         
         Args:
             base_action: 基础动作
@@ -1307,6 +1307,11 @@ class NewAgent(Agent):
             table: 球桌
             initial_score: 可选，Phase 1阶段已计算的sim_score（基于TOP_K_SAMPLES）
                           如果提供，则跳过重复评估，直接使用此分数作为起点
+        
+        Returns:
+            (best_action, final_score): 最佳动作和最终得分
+            
+        回退机制：如果微调后的final_score显著低于初始分数，回退使用base_action
         """
         best_action = base_action.copy()
         
@@ -1314,9 +1319,11 @@ class NewAgent(Agent):
         # 否则进行快速评估
         if initial_score is not None:
             best_score = initial_score
+            base_score_for_rollback = initial_score  # 保存用于回退判断
             logger.debug(f"[Refine] 使用Phase 1的sim_score作为起点: {initial_score:.1f}")
         else:
             best_score = self._evaluate_with_robustness(base_action, balls, my_targets, table, samples=self.SCREEN_SAMPLES)
+            base_score_for_rollback = best_score
         
         cue_ball = balls.get('cue')
         if cue_ball:
@@ -1325,6 +1332,9 @@ class NewAgent(Agent):
             # 最终复核
             final_score = self._evaluate_with_robustness(best_action, balls, my_targets, table, samples=self.FINAL_SAMPLES)
             return best_action, final_score
+        
+        # 记录是否发生了微调更新
+        refined = False
         
         for i in range(self.SIMULATION_COUNT):
             # 微调参数（减小搜索范围以提高精度）
@@ -1363,10 +1373,26 @@ class NewAgent(Agent):
             if score > best_score:
                 best_action = test_action.copy()
                 best_score = score
+                refined = True
                 logger.info(f"[NewAgent] 找到更优方案 (快速得分: {score:.1f})")
         
         # 最终复核：用完整采样重新评估最佳动作
         final_score = self._evaluate_with_robustness(best_action, balls, my_targets, table, samples=self.FINAL_SAMPLES)
+        
+        # ========== 回退机制 ==========
+        # 如果微调后的final_score显著低于初始分数，说明微调"优化坏了"
+        # 此时应该回退使用原始的base_action
+        ROLLBACK_THRESHOLD = 30  # 允许的分数下降幅度
+        
+        if refined and final_score < base_score_for_rollback - ROLLBACK_THRESHOLD:
+            # 对base_action进行完整评估以确认
+            base_final_score = self._evaluate_with_robustness(base_action, balls, my_targets, table, samples=self.FINAL_SAMPLES)
+            
+            if base_final_score > final_score:
+                logger.warning(f"[NewAgent] 微调效果不佳 (初始={base_score_for_rollback:.1f}, 微调后={final_score:.1f}, "
+                              f"base复核={base_final_score:.1f})，回退使用原始方案")
+                return base_action, base_final_score
+        
         logger.info(f"[NewAgent] 模拟优化完成 ({self.SIMULATION_COUNT}次搜索), 快速得分: {best_score:.1f}, 最终得分: {final_score:.1f}")
         
         return best_action, final_score
@@ -1414,11 +1440,12 @@ class NewAgent(Agent):
                         'b': 0.0
                     }
                     
-                    # 使用鲁棒性评估（但降低标准，只要不致命即可）
+                    # 使用鲁棒性评估
                     score = self._evaluate_with_robustness(kick_action, balls, my_targets, table)
                     
-                    # 大力解球的接受标准：不出现致命错误即可
-                    if score > -5000 and score > best_kick_score:
+                    # 大力解球的接受标准：不允许白球落袋(-1000)或误进黑8(-5000+)
+                    # 允许未碰库(-200)等轻微犯规
+                    if score > -500 and score > best_kick_score:
                         best_kick = kick_action
                         best_kick_score = score
                         logger.info(f"[Kick Shot] 找到可行方案: V0={v0:.1f}, phi={test_phi:.1f}, 得分={score:.1f}")
@@ -1454,7 +1481,8 @@ class NewAgent(Agent):
                     
                     score = self._evaluate_with_robustness(bank_action, balls, my_targets, table)
                     
-                    if score > -5000 and score > best_kick_score:
+                    # 同样不允许白球落袋或误进黑8
+                    if score > -500 and score > best_kick_score:
                         best_kick = bank_action
                         best_kick_score = score
                         logger.info(f"[Bank Shot] 找到可行方案: phi={test_phi:.1f}, 得分={score:.1f}")
@@ -1468,7 +1496,10 @@ class NewAgent(Agent):
     
     def _get_safe_shot(self, balls, my_targets, table):
         """生成安全的防守击球（增强版v2：设置防守底线，绝境时大力解球）"""
-        SAFE_SHOT_THRESHOLD = -50  # 防守底线：低于此分数的动作视为不可接受
+        # 防守底线：低于此分数才考虑大力解球
+        # 注意：这个阈值应该比进攻阈值(-80)更宽松，因为防守本身就是保守策略
+        # 只要不犯规（>-150）通常都是可以接受的
+        SAFE_SHOT_THRESHOLD = -150
         
         cue_ball = balls.get('cue')
         if cue_ball is None:
@@ -1707,24 +1738,6 @@ class NewAgent(Agent):
             if final_score < -80:
                 logger.info(f"[NewAgent] 优化后得分仍低 ({final_score:.1f})，改用安全策略")
                 return self._get_safe_shot(balls, my_targets, table)
-            
-            # 最终安全验证
-            cue_ball = balls.get('cue')
-            if cue_ball:
-                cue_pos = self._get_ball_position(cue_ball)
-                first_contact = self._get_first_contact_ball(cue_pos, refined_action['phi'], balls)
-                
-                # 检查首球是否合法
-                if len(remaining_own) > 0:
-                    # 还有目标球
-                    if first_contact is not None and (first_contact not in my_targets or first_contact == '8'):
-                        logger.warning(f"[NewAgent] 最终验证发现首球不合法 ({first_contact})，改用安全策略")
-                        return self._get_safe_shot(balls, my_targets, table)
-                else:
-                    # 只打8号球
-                    if first_contact is not None and first_contact != '8':
-                        logger.warning(f"[NewAgent] 最终验证发现首球不是8号球 ({first_contact})，改用安全策略")
-                        return self._get_safe_shot(balls, my_targets, table)
             
             logger.info(f"[NewAgent] 最终决策: V0={refined_action['V0']:.2f}, "
                        f"phi={refined_action['phi']:.2f}, theta={refined_action['theta']:.2f}")
