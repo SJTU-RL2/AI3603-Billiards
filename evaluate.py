@@ -25,6 +25,9 @@ import os
 # 确保logs目录存在
 os.makedirs('logs', exist_ok=True)
 
+# AGENT_B失败对局的poolenv日志文件
+agent_b_loss_log = "logs/agent_b_losses.log"
+
 # 配置评估日志 - 使用独立的logger避免被poolenv的basicConfig覆盖
 eval_log_filename = "logs/evaluate.log"
 eval_logger = logging.getLogger('evaluate')
@@ -50,7 +53,7 @@ set_random_seed(enable=False, seed=42)
 
 env = PoolEnv()
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
-n_games = 1  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
+n_games = 300  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
 record = 0 # 回放开关
 
 agent_a, agent_b = BasicAgent(), NewAgent()
@@ -78,8 +81,16 @@ eval_logger.info("")
 for i in range(n_games): 
     game_start_time = time.time()
     
+    # 记录本局开始前的poolenv日志位置
+    poolenv_log_path = "logs/poolenv.log"
+    game_log_start_pos = 0
+    if os.path.exists(poolenv_log_path):
+        with open(poolenv_log_path, 'r', encoding='utf-8') as f:
+            f.seek(0, 2)  # 移到文件末尾
+            game_log_start_pos = f.tell()
+    
     print()
-    print(f"------- 第 {i} 局比赛开始 -------")
+    print(f"------- 第 {i + 1} 局比赛开始 -------")
     eval_logger.info(f"{'=' * 40}")
     eval_logger.info(f"第 {i+1}/{n_games} 局比赛")
     
@@ -197,6 +208,33 @@ for i in range(n_games):
             eval_logger.info(f"总击球次数: {info['hit_count']}")
             eval_logger.info(f"本局用时: {game_duration:.2f}秒")
             eval_logger.info("")
+            
+            # 如果AGENT_B输了，提取本局poolenv日志并保存
+            if winner == 'AGENT_A':
+                try:
+                    if os.path.exists(poolenv_log_path):
+                        with open(poolenv_log_path, 'r', encoding='utf-8') as f:
+                            # 读取本局的日志内容（从game_log_start_pos到当前位置）
+                            f.seek(game_log_start_pos)
+                            game_log_content = f.read()
+                        
+                        # 追加到AGENT_B失败日志文件
+                        with open(agent_b_loss_log, 'a', encoding='utf-8') as f:
+                            f.write(f"\n{'='*80}\n")
+                            f.write(f"第 {i+1} 局 - AGENT_B 失败\n")
+                            f.write(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                            f.write(f"开球方: {breaker}\n")
+                            f.write(f"Player A 使用: {player_class}\n")
+                            f.write(f"目标球型: {ball_type}\n")
+                            f.write(f"失败原因: {win_reason}\n")
+                            f.write(f"击球次数: {info['hit_count']}\n")
+                            f.write(f"用时: {game_duration:.2f}秒\n")
+                            f.write(f"{'='*80}\n")
+                            f.write(game_log_content)
+                        
+                        eval_logger.info(f"[记录] AGENT_B 失败日志已保存到 {agent_b_loss_log}")
+                except Exception as e:
+                    eval_logger.warning(f"[警告] 保存AGENT_B失败日志时出错: {e}")
             
             break
 
