@@ -15,6 +15,7 @@ evaluate.py - Agent 评估脚本
 # 导入必要的模块
 from utils import set_random_seed
 from poolenv import PoolEnv
+import pooltool as pt
 from agent import BasicAgent, NewAgent
 import time
 import logging
@@ -49,7 +50,8 @@ set_random_seed(enable=False, seed=42)
 
 env = PoolEnv()
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
-n_games = 300  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
+n_games = 1  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
+record = 0 # 回放开关
 
 agent_a, agent_b = BasicAgent(), NewAgent()
 
@@ -123,6 +125,9 @@ for i in range(n_games):
             if step_info.get('ENEMY_INTO_POCKET'):
                 print(f"对方球入袋：{step_info['ENEMY_INTO_POCKET']}")
         if done:
+            if record:
+                print("正在开启回放界面... (按 'n' 切换下一杆, 按 'p' 切换前一杆, 按 'Esc' 退出并开始下一局)")
+                pt.show(env.shot_record)
             game_end_time = time.time()
             game_duration = game_end_time - game_start_time
             game_times.append(game_duration)
