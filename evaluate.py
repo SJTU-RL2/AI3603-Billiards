@@ -49,7 +49,7 @@ set_random_seed(enable=False, seed=42)
 
 env = PoolEnv()
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
-n_games = 2  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
+n_games = 300  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
 
 agent_a, agent_b = BasicAgent(), NewAgent()
 
@@ -137,16 +137,16 @@ for i in range(n_games):
                 win_reason = "平局（超过最大回合数）"
             elif (last_step_info.get('WHITE_BALL_INTO_POCKET') == True and 
                   last_step_info.get('BLACK_BALL_INTO_POCKET') == True):
-                win_reason = "对手白球+黑8同时进袋"
+                win_reason = "对手白球与黑8同时进袋"
             elif last_step_info.get('BLACK_BALL_INTO_POCKET') == True:
                 # 检查是否合法打进黑8（通过判断winner是否是打球方）
                 # 如果黑8进袋且当前winner不是打球方，说明是非法打进
                 current_player = player  # 最后打球的是谁（循环中的player）
                 # 注意：done时winner已经确定，如果winner不是当前打球方，说明是犯规
                 if info['winner'] == current_player:
-                    win_reason = "合法打进黑8"
+                    win_reason = "合法打进黑8     "
                 else:
-                    win_reason = "对手非法打进黑8"
+                    win_reason = "对手非法打进黑8   "
             elif last_step_info.get('WHITE_BALL_INTO_POCKET') == True:
                 win_reason = "对手白球进袋犯规（关键时刻）"
             elif last_step_info.get('NO_HIT') == True:
@@ -253,15 +253,19 @@ for detail in game_details:
                     f"{detail['win_reason']:<40} {detail['duration']:<10.2f} {detail['hit_count']:<8}")
 eval_logger.info("")
 
-# 5. 获胜原因统计
-eval_logger.info("【获胜原因分析】")
-win_reason_count = {}
+# 5. AGENT_A获胜原因统计
+eval_logger.info("【AGENT_A获胜原因分析】")
+agent_a_win_reason_count = {}
 for detail in game_details:
-    reason = detail['win_reason']
-    win_reason_count[reason] = win_reason_count.get(reason, 0) + 1
+    if detail['winner'] == 'AGENT_A':
+        reason = detail['win_reason']
+        agent_a_win_reason_count[reason] = agent_a_win_reason_count.get(reason, 0) + 1
 
-for reason, count in sorted(win_reason_count.items(), key=lambda x: x[1], reverse=True):
-    eval_logger.info(f"{reason}: {count}次 ({count/len(game_details)*100:.1f}%)")
+if agent_a_win_reason_count:
+    for reason, count in sorted(agent_a_win_reason_count.items(), key=lambda x: x[1], reverse=True):
+        eval_logger.info(f"{reason}: {count}次 ({count/results['AGENT_A_WIN']*100:.1f}%)")
+else:
+    eval_logger.info("AGENT_A未获胜")
 eval_logger.info("")
 
 eval_logger.info("=" * 80)
